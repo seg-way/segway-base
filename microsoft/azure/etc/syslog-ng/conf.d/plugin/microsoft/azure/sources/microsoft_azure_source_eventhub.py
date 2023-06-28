@@ -1,61 +1,152 @@
+import orjson
+import time
 from syslogng import LogSource
 from syslogng import LogMessage
+from syslogng import Logger
+import asyncio
 
 import os
-import logging
-from azure.eventhub import EventHubConsumerClient
-from azure.eventhub.extensions.checkpointstoreblob import BlobCheckpointStore
+from azure.eventhub import PartitionContext, EventData
+from azure.eventhub.aio import EventHubConsumerClient
+from azure.eventhub.extensions.checkpointstoreblobaio import (
+    BlobCheckpointStore,
+)
+from flatten_dict import flatten
 
-BLOB_STORAGE_CONNECTION_STRING = os.environ["AZURE_STORAGE_CONN_STR"]
+logger = Logger()
 
-BLOB_CONTAINER_NAME = os.environ["AZURE_STORAGE_CONTAINER"]
+BLOB_STORAGE_CONNECTION_STRING: str = os.environ["AZURE_STORAGE_CONN_STR"]
+BLOB_CONTAINER_NAME: str = os.environ["AZURE_STORAGE_CONTAINER"]
+EVENT_HUB_CONNECTION_STR: str = os.environ["EVENT_HUB_CONN_STR"]
+# EVENT_HUB_NAME = os.environ['EVENT_HUB_NAME']
+EVENT_HUB_CONSUMER_GROUP: str = os.environ["EVENT_HUB_CONSUMER_GROUP"]
 
-EVENT_HUB_CONNECTION_STR = os.environ["EVENT_HUB_CONN_STR"]
-EVENT_HUB_NAME = os.environ['EVENT_HUB_NAME']
-EVENT_HUB_CONSUMER_GROUP = os.environ['EVENT_HUB_CONSUMER_GROUP']
 
+class MicrosoftEventHubSource(LogSource):
+    """Provides a syslog-ng async source for Microsoft Event hub"""
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger(__name__)
+    cancelled: bool = False
 
-class hub(LogSource):
+    def init(self, options):
+        """Class init with options"""
 
-    def init(self, options):  # optional
-        print(options)
-        self.exit = False
-        self.checkpoint_store = BlobCheckpointStore.from_connection_string(BLOB_STORAGE_CONNECTION_STRING, BLOB_CONTAINER_NAME)
-        self.client = EventHubConsumerClient.from_connection_string(
-            EVENT_HUB_CONNECTION_STR,
-            consumer_group=EVENT_HUB_CONSUMER_GROUP,
-            eventhub_name=EVENT_HUB_NAME,
-            checkpoint_store=self.checkpoint_store,
-        )
-
+        # logger.trace(options)
+        logger.trace(BLOB_STORAGE_CONNECTION_STRING)
+        logger.trace(BLOB_CONTAINER_NAME)
+        logger.trace(EVENT_HUB_CONNECTION_STR)
+        logger.trace(EVENT_HUB_CONSUMER_GROUP)
         return True
 
-    # def deinit(self):  # optional
-    #     self.client
+    def run(self):
+        """Simple Run method to create the loop"""
+        asyncio.run(self.receive_batch())
 
-    def run(self):  # mandatory
-        while not self.exit:
-            with self.client:
-                self.client.receive_batch(
+    # async def main(self):
+    #     '''This is a main'''
+    #     await asyncio.gather(self.receive_batch())
+
+    async def receive_batch(self):
+        """Do the work"""
+        checkpoint_store: BlobCheckpointStore = (
+            BlobCheckpointStore.from_connection_string(
+                BLOB_STORAGE_CONNECTION_STRING, BLOB_CONTAINER_NAME
+            )
+        )
+        client: EventHubConsumerClient = EventHubConsumerClient.from_connection_string(
+            EVENT_HUB_CONNECTION_STR,
+            consumer_group=EVENT_HUB_CONSUMER_GROUP,
+            checkpoint_store=checkpoint_store,
+            check_case=True,
+        )
+        async with client:
+            while not self.cancelled:
+                await client.receive_batch(
                     on_event_batch=self.on_event_batch,
-                    max_batch_size=100,
+                    max_batch_size=1000,
+                    prefetch=2000,
+                    max_wait_time=10,
                     starting_position="-1",  # "-1" is from the beginning of the partition.
-                    track_last_enqueued_event_properties = True,                                
+                    track_last_enqueued_event_properties=True,
                 )
+            logger.info("ehs: run will sleep")
+            await asyncio.sleep(1)
 
-    def request_exit(self):  # mandatory
-        print("exit")
-        self.exit = True
+    def request_exit(self):
+        """Called by syslog NG on exit"""
+        self.cancelled = True
 
-    def on_event_batch(self,partition_context, event_batch):
-        log.info("Partition {}, Received count: {}".format(partition_context.partition_id, len(event_batch)))
+    async def batch_process_events(self, event_batch: EventData):
+        """Process one batch"""
+        # put your code here
         for event in event_batch:
-            msg = LogMessage(event.body_as_str(encoding="UTF-8"))
-            self.post_message(msg)    
-        partition_context.update_checkpoint()
+            event_str = event.body_as_str(encoding="UTF-8")
+            event_obj = orjson.loads(event_str)
+            logger.debug(f'ehs: Record count {len(event_obj["records"])}')
+            for record in event_obj["records"]:
+                # raw_message = orjson.dumps(record)
+                # print(f"rawmsg={raw_message}")
 
 
+                record_cleaned = MicrosoftEventHubSource.clean_event(record)
+                message = orjson.dumps(record_cleaned)
+                # print(f"message={message}")
+                # print(
+                #     f"delta={len(raw_message)-len(message)} raw_message_len={len(raw_message)} message_len={len(message)}"
+                # )
 
+                record_lmsg = LogMessage(message)
+                # record_lmsg["RAWMSG"] = raw_message
+                record_lmsg[".internal.enqueued_time"] = event.enqueued_time.isoformat()
+
+                # record_flat = flatten(record_cleaned, reducer="dot")
+                # print(f"recordflat={record_flat}")
+                # for k, v in record_flat.items():
+                #     fk = f".Vendor.{k}"
+                #     # print(f"flattened {fk}={v}")
+                #     record_lmsg[fk] = v
+                self.post_message(record_lmsg)
+
+    async def on_event_batch(
+        self, partition_context: PartitionContext, event_batch: EventData
+    ):
+        """Accept call from api with batch"""
+        logger.debug(
+            f"ehs: Partition {partition_context.partition_id}, Received count: {len(event_batch)}"
+        )
+        if len(event_batch) > 0:
+            await self.batch_process_events(event_batch)
+            await partition_context.update_checkpoint()
+
+    @staticmethod
+    def clean_event(source_dict: dict):
+        """
+        Delete keys with the value ``None``  or ```` (empty) string in a dictionary, recursively.
+        Remove empty list and dict objects
+
+        This alters the input so you may wish to ``copy`` the dict first.
+        """
+        # For Python 3, write `list(d.items())`; `d.items()` won’t work
+        # For Python 2, write `d.items()`; `d.iteritems()` won’t work
+        for key, value in list(source_dict.items()):
+            if value is None:
+                del source_dict[key]
+            elif isinstance(value, str) and value in ("", "None", "none"):
+                del source_dict[key]
+            elif isinstance(value, str):
+                if value.endswith("\n"):
+                    value = value.strip("\n")
+
+                if value.startswith('{"'):
+                    try:
+                        value = orjson.loads(value)
+                        MicrosoftEventHubSource.clean_event(value)
+                        source_dict[key] = value
+                    except orjson.JSONDecodeError:
+                        pass
+            elif isinstance(value, dict) and not value:
+                del source_dict[key]
+            elif isinstance(value, dict):
+                MicrosoftEventHubSource.clean_event(value)
+            elif isinstance(value, list) and not value:
+                del source_dict[key]
+        return source_dict  # For convenience
