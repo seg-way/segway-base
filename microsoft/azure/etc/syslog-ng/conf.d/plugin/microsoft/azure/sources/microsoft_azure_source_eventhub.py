@@ -78,33 +78,29 @@ class MicrosoftEventHubSource(LogSource):
     async def batch_process_events(self, event_batch: EventData):
         """Process one batch"""
         # put your code here
-        for event in event_batch:
-            event_str = event.body_as_str(encoding="UTF-8")
-            event_obj = orjson.loads(event_str)
-            logger.debug(f'ehs: Record count {len(event_obj["records"])}')
-            for record in event_obj["records"]:
-                # raw_message = orjson.dumps(record)
-                # print(f"rawmsg={raw_message}")
+        try:
+            for event in event_batch:
+                event_str = event.body_as_str(encoding="UTF-8")
+                event_obj = orjson.loads(event_str)
+                logger.debug(f'ehs: Record count {len(event_obj["records"])}')            
+                if "records" in event_obj:
+                    for record in event_obj["records"]:
 
+                        MicrosoftEventHubSource.clean_event(record)
+                        message = orjson.dumps(record)
 
-                record_cleaned = MicrosoftEventHubSource.clean_event(record)
-                message = orjson.dumps(record_cleaned)
-                # print(f"message={message}")
-                # print(
-                #     f"delta={len(raw_message)-len(message)} raw_message_len={len(raw_message)} message_len={len(message)}"
-                # )
+                        record_lmsg = LogMessage(message)
+                        record_lmsg[".internal.enqueued_time"] = event.enqueued_time.isoformat()
 
-                record_lmsg = LogMessage(message)
-                # record_lmsg["RAWMSG"] = raw_message
-                record_lmsg[".internal.enqueued_time"] = event.enqueued_time.isoformat()
+                        self.post_message(record_lmsg)
+                else:
+                    MicrosoftEventHubSource.clean_event(event_obj)
+                    message = orjson.dumps(event_obj)
+                    record_lmsg = LogMessage(message)
+                    self.post_message(record_lmsg)
+        except Exception as argument:            
+            logger.error(argument)
 
-                # record_flat = flatten(record_cleaned, reducer="dot")
-                # print(f"recordflat={record_flat}")
-                # for k, v in record_flat.items():
-                #     fk = f".Vendor.{k}"
-                #     # print(f"flattened {fk}={v}")
-                #     record_lmsg[fk] = v
-                self.post_message(record_lmsg)
 
     async def on_event_batch(
         self, partition_context: PartitionContext, event_batch: EventData
